@@ -387,3 +387,6 @@
 [submodule "contrib/antlr4-cpp-runtime"]
 	path = contrib/antlr4-cpp-runtime
 	url = https://github.com/antlr/antlr4.git
+[submodule "contrib/vortex"]
+	path = contrib/vortex
+	url = https://github.com/vortex-data/vortex

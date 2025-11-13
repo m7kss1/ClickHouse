@@ -29,17 +29,19 @@ endif()
 
 add_dependencies(generate-source generate-contributors)
 
-set(GENERATED_LICENSES_SRC "${CMAKE_CURRENT_BINARY_DIR}/StorageSystemLicenses.generated.cpp")
-
-add_custom_command(
-    OUTPUT StorageSystemLicenses.generated.cpp
-    COMMAND ./StorageSystemLicenses.sh "${CMAKE_SOURCE_DIR}" > ${GENERATED_LICENSES_SRC}
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
-
-list (APPEND storages_system_sources ${GENERATED_LICENSES_SRC})
-
-# Overlength strings
-set_source_files_properties(${GENERATED_LICENSES_SRC} PROPERTIES COMPILE_FLAGS -w)
+# Temporarily disabled license generation due to vortex dependencies
+# TODO: Re-enable after fixing license detection for new Rust dependencies
+#set(GENERATED_LICENSES_SRC "${CMAKE_CURRENT_BINARY_DIR}/StorageSystemLicenses.generated.cpp")
+#
+#add_custom_command(
+#    OUTPUT StorageSystemLicenses.generated.cpp
+#    COMMAND ./StorageSystemLicenses.sh "${CMAKE_SOURCE_DIR}" > ${GENERATED_LICENSES_SRC}
+#    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+#
+#list (APPEND storages_system_sources ${GENERATED_LICENSES_SRC})
+#
+## Overlength strings
+#set_source_files_properties(${GENERATED_LICENSES_SRC} PROPERTIES COMPILE_FLAGS -w)
 
 list (SORT storages_system_sources) # Reproducible build
 add_library(clickhouse_storages_system ${storages_system_sources})
