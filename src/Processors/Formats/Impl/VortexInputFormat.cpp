@@ -17,14 +17,27 @@ void registerInputFormatVortex(FormatFactory & factory)
            const ReadSettings &,
            bool,
            FormatParserSharedResourcesPtr,
-           FormatFilterInfoPtr) -> InputFormatPtr
+           FormatFilterInfoPtr format_filter_info) -> InputFormatPtr
         {
             auto & seekable_buf = dynamic_cast<SeekableReadBuffer &>(buf);
             return std::make_shared<VortexBlockInputFormat>(
                 seekable_buf,
                 std::make_shared<const Block>(sample),
+                std::move(format_filter_info),
                 settings);
         });
 }
+
+void registerVortexSchemaReader(FormatFactory & factory)
+{
+    factory.registerSchemaReader(
+        "Vortex",
+        [](ReadBuffer & buf, const FormatSettings & settings)
+        {
+            auto & seekable_buf = dynamic_cast<SeekableReadBuffer &>(buf);
+            return std::make_shared<VortexSchemaReader>(seekable_buf, settings);
+        });
+}
+
 
 }  /// namespace DB

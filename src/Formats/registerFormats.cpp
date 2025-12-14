@@ -67,6 +67,7 @@ void registerOutputFormatORC(FormatFactory & factory);
 void registerInputFormatParquet(FormatFactory & factory);
 void registerOutputFormatParquet(FormatFactory & factory);
 void registerInputFormatVortex(FormatFactory & factory);
+void registerVortexSchemaReader(FormatFactory & factory);
 void registerInputFormatArrow(FormatFactory & factory);
 void registerOutputFormatArrow(FormatFactory & factory);
 void registerInputFormatAvro(FormatFactory & factory);
@@ -265,6 +266,7 @@ void registerFormats()
     registerNonTrivialPrefixAndSuffixCheckerJSONAsObject(factory);
 
     registerArrowSchemaReader(factory);
+    registerVortexSchemaReader(factory);
     registerParquetSchemaReader(factory);
     registerORCSchemaReader(factory);
     registerTSVSchemaReader(factory);
