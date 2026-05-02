@@ -98,6 +98,7 @@ add_contrib (msgpack-c-cmake msgpack-c)
 add_contrib (libarchive-cmake libarchive)
 
 add_contrib (corrosion-cmake corrosion)
+add_contrib (vortex-cmake vortex)
 add_contrib (delta-kernel-rs-cmake delta-kernel-rs)
 add_contrib (chdig-cmake chdig)
 add_contrib (wasmedge-cmake wasmedge)

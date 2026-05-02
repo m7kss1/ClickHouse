@@ -29,6 +29,10 @@ void registerStorageFuzzQuery(StorageFactory & factory);
 void registerStorageTimeSeries(StorageFactory & factory);
 void registerStorageAlias(StorageFactory & factory);
 
+#if USE_VORTEX
+void registerStorageVortex(StorageFactory & factory);
+#endif
+
 #if USE_ARROWFLIGHT
 void registerStorageArrowFlight(StorageFactory & factory);
 #endif
@@ -137,6 +141,10 @@ void registerStorages()
     registerStorageFuzzQuery(factory);
     registerStorageTimeSeries(factory);
     registerStorageAlias(factory);
+
+#if USE_VORTEX
+    registerStorageVortex(factory);
+#endif
 
 #if USE_ARROWFLIGHT
     registerStorageArrowFlight(factory);

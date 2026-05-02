@@ -289,6 +289,10 @@ add_object_library(clickhouse_backups Backups)
 add_object_library(clickhouse_core Core)
 list (APPEND dbms_sources Common/ExceptionExt.cpp)
 
+if (USE_VORTEX)
+    list (APPEND dbms_sources Storages/StorageVortex.cpp)
+endif()
+
 add_object_library(clickhouse_core_mysql Core/MySQL)
 add_object_library(clickhouse_querypipeline QueryPipeline)
 add_object_library(clickhouse_datatypes DataTypes)
@@ -788,6 +792,10 @@ if (TARGET ch_rust::delta_kernel_rs)
     target_link_libraries(clickhouse_common_io PRIVATE ch_rust::delta_kernel_rs)
     target_link_libraries(dbms PRIVATE ch_rust::delta_kernel_rs)
 endif ()
+
+if (TARGET ch_rust::vortex)
+    target_link_libraries(dbms PRIVATE ch_rust::vortex)
+endif()
 
 if (TARGET ch_contrib::sha3iuf)
     target_link_libraries(dbms PUBLIC ch_contrib::sha3iuf)

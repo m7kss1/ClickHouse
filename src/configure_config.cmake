@@ -233,6 +233,9 @@ endif()
 if (TARGET ch_rust::wasmtime)
     set(USE_WASMTIME 1)
 endif()
+if (TARGET ch_rust::vortex)
+    set(USE_VORTEX 1)
+endif()
 
 set (USE_YTSAURUS 1)
 
