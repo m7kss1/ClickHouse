@@ -5,13 +5,21 @@
 #if USE_ARROW
 
 #include <Common/Exception.h>
+#include <Core/Field.h>
+#include <DataTypes/IDataType.h>
+#include <DataTypes/DataTypeNullable.h>
 #include <Formats/FormatFactory.h>
+#include <Functions/IFunction.h>
 #include <Interpreters/Context.h>
+#include <Interpreters/convertFieldToType.h>
 #include <Interpreters/evaluateConstantExpression.h>
 #include <Processors/Formats/Impl/ArrowColumnToCHColumn.h>
 #include <Processors/ISource.h>
 #include <Processors/Sources/NullSource.h>
+#include <Processors/QueryPlan/QueryPlan.h>
+#include <Processors/QueryPlan/SourceStepWithFilter.h>
 #include <QueryPipeline/Pipe.h>
+#include <QueryPipeline/QueryPipelineBuilder.h>
 #include <Storages/ColumnsDescription.h>
 #include <Storages/IStorage.h>
 #include <Storages/SelectQueryInfo.h>
@@ -58,6 +66,22 @@ String getVortexErrorMessage(const vx_error * error)
         return "unknown Vortex error";
 
     return {vx_string_ptr(message), vx_string_len(message)};
+}
+
+struct VortexExpressionDeleter
+{
+    void operator()(vx_expression * expression) const
+    {
+        if (expression)
+            vx_expression_free(expression);
+    }
+};
+
+using VortexExpressionPtr = std::unique_ptr<vx_expression, VortexExpressionDeleter>;
+
+VortexExpressionPtr makeExpr(vx_expression * ptr)
+{
+    return VortexExpressionPtr(ptr, VortexExpressionDeleter{});
 }
 
 class VortexError
@@ -134,23 +158,25 @@ struct VortexScanDeleter
     }
 };
 
-struct VortexExpressionDeleter
+struct VortexScalarDeleter
 {
-    void operator()(vx_expression * expression) const
+    void operator()(vx_scalar * scalar) const
     {
-        if (expression)
-            vx_expression_free(expression);
+        if (scalar)
+            vx_scalar_free(scalar);
     }
 };
 
 using VortexSessionPtr = std::unique_ptr<vx_session, VortexSessionDeleter>;
 using VortexDataSourcePtr = std::unique_ptr<const vx_data_source, VortexDataSourceDeleter>;
 using VortexScanPtr = std::unique_ptr<vx_scan, VortexScanDeleter>;
-using VortexExpressionPtr = std::unique_ptr<vx_expression, VortexExpressionDeleter>;
+using VortexScalarPtr = std::unique_ptr<vx_scalar, VortexScalarDeleter>;
 using ArrowSchemaPtr = std::shared_ptr<arrow::Schema>;
 
 VortexSessionPtr createVortexSession()
 {
+    /// vx_set_log_level(LOG_LEVEL_DEBUG);
+
     VortexSessionPtr session(vx_session_new());
     if (!session)
         throw Exception(ErrorCodes::UNKNOWN_EXCEPTION, "Failed to create Vortex session");
@@ -270,6 +296,7 @@ private:
 
 struct VortexScanWithEstimate
 {
+    VortexSessionPtr session;
     VortexScanPtr scan;
     vx_estimate partition_count{};
     ArrowSchemaPtr arrow_schema;
@@ -417,7 +444,7 @@ private:
     std::optional<ArrowArrayStreamHolder> stream;
 };
 
-}
+} // anonymous namespace
 
 class StorageVortex final : public IStorage
 {
@@ -447,39 +474,15 @@ public:
 
     String getName() const override { return "Vortex"; }
 
-    Pipe read(
+    void read(
+        QueryPlan & query_plan,
         const Names & column_names,
         const StorageSnapshotPtr & storage_snapshot,
-        SelectQueryInfo &,
+        SelectQueryInfo & query_info,
         ContextPtr context,
         QueryProcessingStage::Enum,
-        size_t,
-        size_t num_streams) override
-    {
-        storage_snapshot->check(column_names);
-
-        auto header = std::make_shared<const Block>(storage_snapshot->getSampleBlockForColumns(column_names));
-        auto scan_result = createScan(column_names, num_streams);
-
-        size_t stream_count = std::max<size_t>(1, num_streams);
-        if (scan_result.partition_count.type != VX_ESTIMATE_UNKNOWN)
-        {
-            if (scan_result.partition_count.estimate == 0)
-                return Pipe(std::make_shared<NullSource>(header));
-            stream_count = std::min<size_t>(stream_count, scan_result.partition_count.estimate);
-        }
-
-        auto shared_scan = std::make_shared<SharedVortexScan>(
-            cloneVortexSession(session.get()), std::move(scan_result.scan), std::move(scan_result.arrow_schema));
-
-        Pipes pipes;
-        pipes.reserve(stream_count);
-        auto format_settings = getFormatSettings(context);
-        for (size_t i = 0; i < stream_count; ++i)
-            pipes.emplace_back(std::make_shared<VortexSource>(header, shared_scan, format_settings));
-
-        return Pipe::unitePipes(std::move(pipes));
-    }
+        size_t max_block_size,
+        size_t num_streams) override;
 
     std::optional<UInt64> totalRows(ContextPtr) const override
     {
@@ -490,8 +493,10 @@ public:
         return std::nullopt;
     }
 
-private:
-    VortexScanWithEstimate createScan(const Names & column_names, size_t num_streams) const
+    VortexScanWithEstimate createScan(
+        const Names & column_names,
+        size_t num_streams,
+        const vx_expression * filter) const
     {
         VortexExpressionPtr root;
         VortexExpressionPtr projection;
@@ -499,6 +504,7 @@ private:
 
         vx_scan_options options{};
         options.max_threads = num_streams;
+        options.filter = filter;
 
         if (!column_names.empty())
         {
@@ -519,6 +525,7 @@ private:
 
         VortexError error;
         VortexScanWithEstimate result;
+        result.session = cloneVortexSession(session.get());
         result.scan.reset(vx_data_source_scan(data_source.get(), &options, &result.partition_count, error.out()));
         if (error)
             error.throwException("Failed to create Vortex scan");
@@ -533,10 +540,415 @@ private:
         return result;
     }
 
+private:
     String paths;
     VortexSessionPtr session;
     VortexDataSourcePtr data_source;
 };
+
+class ReadFromVortex : public SourceStepWithFilter
+{
+public:
+    std::string getName() const override { return "ReadFromVortex"; }
+
+    void initializePipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings &) override;
+    void applyFilters(ActionDAGNodes added_filter_nodes) override;
+    void updatePrewhereInfo(const PrewhereInfoPtr &) override {}
+
+    ReadFromVortex(
+        const Names & column_names_,
+        const SelectQueryInfo & query_info_,
+        const StorageSnapshotPtr & storage_snapshot_,
+        const ContextPtr & context_,
+        std::shared_ptr<StorageVortex> storage_,
+        size_t num_streams_)
+        : SourceStepWithFilter(
+              std::make_shared<const Block>(storage_snapshot_->getSampleBlockForColumns(column_names_)),
+              column_names_,
+              query_info_,
+              storage_snapshot_,
+              context_)
+        , storage(std::move(storage_))
+        , num_streams(num_streams_)
+    {
+    }
+
+private:
+    VortexExpressionPtr createFilter(const ActionsDAG::Node * node);
+    VortexExpressionPtr createLiteral(const ActionsDAG::Node * node, const DataTypePtr & target_type = nullptr);
+
+    template <vx_binary_operator Op>
+    VortexExpressionPtr createExprFromBinary(const ActionsDAG::Node * node);
+
+    /// NOTE: skip_failed_children=true is only safe for AND
+    /// For OR it would produce a subset data loss, so OR always passes false
+    template <vx_expression * (*Func)(const vx_expression * const *, size_t)>
+    VortexExpressionPtr createExprFromVariadic(const ActionsDAG::Node * node, bool skip_failed_children = false);
+
+    std::shared_ptr<StorageVortex> storage;
+    VortexExpressionPtr filter;
+    VortexExpressionPtr filter_root;
+    size_t num_streams;
+};
+
+void ReadFromVortex::applyFilters(ActionDAGNodes added_filter_nodes)
+{
+    SourceStepWithFilter::applyFilters(std::move(added_filter_nodes));
+
+    const ActionsDAG::Node * predicate = filter_actions_dag
+        ? filter_actions_dag->getOutputs().at(0)
+        : nullptr;
+
+    if (!predicate)
+        return;
+
+    filter_root = makeExpr(vx_expression_root());
+    if (!filter_root)
+        return;
+
+    filter = createFilter(predicate);
+}
+
+void ReadFromVortex::initializePipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings &)
+{
+    auto scan_result = storage->createScan(required_source_columns, num_streams, filter.get());
+
+    size_t stream_count = std::max<size_t>(1, num_streams);
+    if (scan_result.partition_count.type != VX_ESTIMATE_UNKNOWN)
+    {
+        if (scan_result.partition_count.estimate == 0)
+        {
+            pipeline.init(Pipe(std::make_shared<NullSource>(output_header)));
+            return;
+        }
+        stream_count = std::min<size_t>(stream_count, scan_result.partition_count.estimate);
+    }
+
+    auto shared_scan = std::make_shared<SharedVortexScan>(
+        std::move(scan_result.session),
+        std::move(scan_result.scan),
+        std::move(scan_result.arrow_schema));
+
+    Pipes pipes;
+    pipes.reserve(stream_count);
+    auto format_settings = getFormatSettings(getContext());
+    for (size_t i = 0; i < stream_count; ++i)
+        pipes.emplace_back(std::make_shared<VortexSource>(output_header, shared_scan, format_settings));
+
+    pipeline.init(Pipe::unitePipes(std::move(pipes)));
+}
+
+VortexExpressionPtr ReadFromVortex::createLiteral(const ActionsDAG::Node * node, const DataTypePtr & target_type)
+{
+    if (!node->column || node->column->empty())
+        return nullptr;
+
+    Field field;
+    node->column->get(0, field);
+
+    if (field.isNull())
+        return nullptr;
+
+    const DataTypePtr & source_raw_type = node->result_type;
+
+    if (WhichDataType(source_raw_type).isLowCardinality())
+        return nullptr;
+    if (target_type && WhichDataType(target_type).isLowCardinality())
+        return nullptr;
+
+    const DataTypePtr source_type = removeNullable(source_raw_type);
+
+    DataTypePtr effective_type;
+    bool is_nullable;
+
+    if (target_type)
+    {
+        effective_type = removeNullable(target_type);
+        is_nullable = target_type->isNullable();
+
+        if (!effective_type->equals(*source_type))
+        {
+            Field converted = convertFieldToType(field, *effective_type, source_type.get());
+            if (converted.isNull())
+                return nullptr;
+            field = std::move(converted);
+        }
+    }
+    else
+    {
+        effective_type = source_type;
+        is_nullable = source_raw_type->isNullable();
+    }
+
+    WhichDataType which(effective_type);
+
+    VortexScalarPtr scalar;
+
+    if (which.isUInt8())
+        scalar.reset(vx_scalar_new_u8(static_cast<uint8_t>(field.safeGet<UInt64>()), is_nullable));
+    else if (which.isUInt16())
+        scalar.reset(vx_scalar_new_u16(static_cast<uint16_t>(field.safeGet<UInt64>()), is_nullable));
+    else if (which.isUInt32())
+        scalar.reset(vx_scalar_new_u32(static_cast<uint32_t>(field.safeGet<UInt64>()), is_nullable));
+    else if (which.isUInt64())
+        scalar.reset(vx_scalar_new_u64(field.safeGet<UInt64>(), is_nullable));
+    else if (which.isInt8())
+        scalar.reset(vx_scalar_new_i8(static_cast<int8_t>(field.safeGet<Int64>()), is_nullable));
+    else if (which.isInt16())
+        scalar.reset(vx_scalar_new_i16(static_cast<int16_t>(field.safeGet<Int64>()), is_nullable));
+    else if (which.isInt32())
+        scalar.reset(vx_scalar_new_i32(static_cast<int32_t>(field.safeGet<Int64>()), is_nullable));
+    else if (which.isInt64())
+        scalar.reset(vx_scalar_new_i64(field.safeGet<Int64>(), is_nullable));
+    else if (which.isFloat32())
+        scalar.reset(vx_scalar_new_f32(static_cast<float>(field.safeGet<Float64>()), is_nullable));
+    else if (which.isFloat64())
+        scalar.reset(vx_scalar_new_f64(field.safeGet<Float64>(), is_nullable));
+    else if (which.isDate())
+        scalar.reset(vx_scalar_new_u16(static_cast<uint16_t>(field.safeGet<UInt64>()), is_nullable));
+    else if (which.isDate32())
+        scalar.reset(vx_scalar_new_i32(static_cast<int32_t>(field.safeGet<Int64>()), is_nullable));
+    else if (which.isDateTime())
+        scalar.reset(vx_scalar_new_i64(static_cast<int64_t>(field.safeGet<UInt64>()), is_nullable));
+    else if (which.isStringOrFixedString())
+    {
+        const auto & str = field.safeGet<String>();
+        VortexError err;
+        scalar.reset(vx_scalar_new_utf8(str.data(), str.size(), is_nullable, err.out()));
+        if (err)
+            return nullptr;
+    }
+    else
+        return nullptr;
+
+    if (!scalar)
+        return nullptr;
+
+    VortexError err;
+    auto expr = makeExpr(vx_expression_literal(scalar.get(), err.out()));
+    if (err || !expr)
+        return nullptr;
+
+    return expr;
+}
+
+VortexExpressionPtr ReadFromVortex::createFilter(const ActionsDAG::Node * node)
+{
+    if (!node)
+        return nullptr;
+
+    switch (node->type)
+    {
+        case ActionsDAG::ActionType::INPUT:
+        {
+            auto expr = makeExpr(vx_expression_get_item(node->result_name.c_str(), filter_root.get()));
+            if (!expr)
+                return nullptr;
+            return expr;
+        }
+
+        case ActionsDAG::ActionType::ALIAS:
+        {
+            if (node->children.size() != 1)
+                return nullptr;
+            return createFilter(node->children[0]);
+        }
+
+        case ActionsDAG::ActionType::COLUMN:
+        {
+            if (!node->children.empty())
+                return nullptr;
+            return createLiteral(node);
+        }
+
+        case ActionsDAG::ActionType::FUNCTION:
+        {
+            const auto & name = node->function_base->getName();
+
+            if (name == "equals")
+                return createExprFromBinary<VX_OPERATOR_EQ>(node);
+            if (name == "notEquals")
+                return createExprFromBinary<VX_OPERATOR_NOT_EQ>(node);
+            if (name == "greater")
+                return createExprFromBinary<VX_OPERATOR_GT>(node);
+            if (name == "greaterOrEquals")
+                return createExprFromBinary<VX_OPERATOR_GTE>(node);
+            if (name == "less")
+                return createExprFromBinary<VX_OPERATOR_LT>(node);
+            if (name == "lessOrEquals")
+                return createExprFromBinary<VX_OPERATOR_LTE>(node);
+
+            if (name == "and")
+                return createExprFromVariadic<vx_expression_and>(node, /*skip_failed_children=*/true);
+            if (name == "or")
+                return createExprFromVariadic<vx_expression_or>(node, /*skip_failed_children=*/false);
+
+            if (name == "not")
+            {
+                if (node->children.size() != 1)
+                    return nullptr;
+                auto child = createFilter(node->children[0]);
+                if (!child)
+                    return nullptr;
+                const vx_expression * result = vx_expression_not(child.get());
+                if (!result)
+                    return nullptr;
+                return makeExpr(const_cast<vx_expression *>(result));
+            }
+
+            if (name == "isNull")
+            {
+                if (node->children.size() != 1)
+                    return nullptr;
+                auto child = createFilter(node->children[0]);
+                if (!child)
+                    return nullptr;
+                return makeExpr(vx_expression_is_null(child.get()));
+            }
+
+            if (name == "isNotNull")
+            {
+                if (node->children.size() != 1)
+                    return nullptr;
+                auto child = createFilter(node->children[0]);
+                if (!child)
+                    return nullptr;
+                auto is_null_expr = makeExpr(vx_expression_is_null(child.get()));
+                if (!is_null_expr)
+                    return nullptr;
+                const vx_expression * result = vx_expression_not(is_null_expr.get());
+                if (!result)
+                    return nullptr;
+                return makeExpr(const_cast<vx_expression *>(result));
+            }
+
+            return nullptr;
+        }
+
+        default:
+            return nullptr;
+    }
+}
+
+template <vx_binary_operator Op>
+VortexExpressionPtr ReadFromVortex::createExprFromBinary(const ActionsDAG::Node * node)
+{
+    if (node->children.size() != 2)
+        return nullptr;
+
+    const auto * lhs_raw = node->children[0];
+    const auto * rhs_raw = node->children[1];
+
+    const auto * lhs_inner = lhs_raw;
+    while (lhs_inner && lhs_inner->type == ActionsDAG::ActionType::ALIAS)
+        lhs_inner = lhs_inner->children.size() == 1 ? lhs_inner->children[0] : nullptr;
+
+    const auto * rhs_inner = rhs_raw;
+    while (rhs_inner && rhs_inner->type == ActionsDAG::ActionType::ALIAS)
+        rhs_inner = rhs_inner->children.size() == 1 ? rhs_inner->children[0] : nullptr;
+
+    if (!lhs_inner || !rhs_inner)
+        return nullptr;
+
+    /// A "constant" side is a materialized COLUMN node
+    const bool lhs_const = lhs_inner->type == ActionsDAG::ActionType::COLUMN
+        && lhs_inner->column && !lhs_inner->column->empty();
+    const bool rhs_const = rhs_inner->type == ActionsDAG::ActionType::COLUMN
+        && rhs_inner->column && !rhs_inner->column->empty();
+
+    /// Both constants: constant folding should have handled this
+    if (lhs_const && rhs_const)
+        return nullptr;
+
+    if (!lhs_const && !rhs_const)
+    {
+        /// Both sides are non-constant
+        /// Only push when types are compatible
+        const DataTypePtr lhs_type = removeNullable(lhs_raw->result_type);
+        const DataTypePtr rhs_type = removeNullable(rhs_raw->result_type);
+        if (WhichDataType(lhs_type).isLowCardinality() || WhichDataType(rhs_type).isLowCardinality())
+            return nullptr;
+        if (!lhs_type->equals(*rhs_type))
+            return nullptr;
+
+        auto lhs = createFilter(lhs_raw);
+        auto rhs = createFilter(rhs_raw);
+        if (!lhs || !rhs)
+            return nullptr;
+        return makeExpr(vx_expression_binary(Op, lhs.get(), rhs.get()));
+    }
+
+    const bool const_is_lhs = lhs_const;
+    const auto * const_node = const_is_lhs ? lhs_inner : rhs_inner;
+    const auto * col_raw = const_is_lhs ? rhs_raw : lhs_raw;
+
+    auto col_expr = createFilter(col_raw);
+    if (!col_expr)
+        return nullptr;
+
+    auto lit_expr = createLiteral(const_node, col_raw->result_type);
+    if (!lit_expr)
+        return nullptr;
+
+    vx_expression * left = const_is_lhs ? lit_expr.get() : col_expr.get();
+    vx_expression * right = const_is_lhs ? col_expr.get() : lit_expr.get();
+
+    return makeExpr(vx_expression_binary(Op, left, right));
+}
+
+template <vx_expression * (*Func)(const vx_expression * const *, size_t)>
+VortexExpressionPtr ReadFromVortex::createExprFromVariadic(const ActionsDAG::Node * node, bool skip_failed_children)
+{
+    if (node->children.empty())
+        return nullptr;
+
+    std::vector<VortexExpressionPtr> child_exprs;
+    std::vector<const vx_expression *> child_ptrs;
+    child_exprs.reserve(node->children.size());
+    child_ptrs.reserve(node->children.size());
+
+    for (const auto * child_node : node->children)
+    {
+        auto child_expr = createFilter(child_node);
+        if (!child_expr)
+        {
+            if (skip_failed_children)
+                continue;
+            return nullptr;
+        }
+
+        child_ptrs.push_back(child_expr.get());
+        child_exprs.emplace_back(std::move(child_expr));
+    }
+
+    if (child_ptrs.empty())
+        return nullptr;
+
+    return makeExpr(Func(child_ptrs.data(), child_ptrs.size()));
+}
+
+void StorageVortex::read(
+    QueryPlan & query_plan,
+    const Names & column_names,
+    const StorageSnapshotPtr & storage_snapshot,
+    SelectQueryInfo & query_info,
+    ContextPtr context,
+    QueryProcessingStage::Enum,
+    size_t /*max_block_size*/,
+    size_t num_streams)
+{
+    storage_snapshot->check(column_names);
+
+    auto reading = std::make_unique<ReadFromVortex>(
+        column_names,
+        query_info,
+        storage_snapshot,
+        context,
+        std::static_pointer_cast<StorageVortex>(shared_from_this()),
+        num_streams);
+
+    query_plan.addStep(std::move(reading));
+}
 
 void registerStorageVortex(StorageFactory & factory)
 {
