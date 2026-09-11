@@ -1623,7 +1623,8 @@ The server successfully detected this situation and will download merged part fr
     M(VortexScanEmptySplits, "Number of Vortex scan splits whose rows were all dropped by the pushed-down filter", ValueType::Number) \
     M(VortexReadRequests, "Number of read requests a Vortex scan issued through the ClickHouse read buffer", ValueType::Number) \
     M(VortexReadBytes, "Number of bytes a Vortex scan read through the ClickHouse read buffer", ValueType::Bytes) \
-    M(VortexConvertMicroseconds, "Time spent turning the Arrow arrays a Vortex scan delivers into ClickHouse columns", ValueType::Microseconds) \
+    M(VortexDecodeMicroseconds, "Time a Vortex scan spent decoding the columns of its splits out of the encodings the file stores them in", ValueType::Microseconds) \
+    M(VortexConvertMicroseconds, "Time spent writing the decoded columns of a Vortex scan into ClickHouse columns", ValueType::Microseconds) \
     M(VortexReadWaitMicroseconds, "Time the pipeline spent waiting for a Vortex scan to deliver the next split", ValueType::Microseconds) \
     M(FilterTransformPassedRows, "Number of rows that passed the filter in the query", ValueType::Number) \
     M(FilterTransformPassedBytes, "Number of bytes that passed the filter in the query", ValueType::Bytes) \

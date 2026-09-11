@@ -8,6 +8,7 @@
 #include <IO/ReadBuffer.h>
 #include <IO/SharedThreadPools.h>
 #include <Processors/Formats/Impl/ArrowColumnToCHColumn.h>
+#include <Processors/Formats/Impl/Vortex/VortexColumnConverter.h>
 #include <Processors/Formats/Impl/Vortex/VortexFFIHelpers.h>
 #include <Processors/Formats/Impl/Vortex/VortexScanPlanner.h>
 #include <Processors/Port.h>
@@ -15,6 +16,7 @@
 #include <Common/CurrentThread.h>
 #include <Common/Exception.h>
 #include <Common/assert_cast.h>
+#include <Common/logger_useful.h>
 #include <Common/ProfileEvents.h>
 #include <Common/Stopwatch.h>
 #include <Common/setThreadName.h>
@@ -34,6 +36,7 @@ namespace ProfileEvents
 {
 extern const Event VortexScanSplits;
 extern const Event VortexScanEmptySplits;
+extern const Event VortexDecodeMicroseconds;
 extern const Event VortexConvertMicroseconds;
 extern const Event VortexReadWaitMicroseconds;
 }
@@ -82,10 +85,10 @@ extern "C" void vortexFFINotifyCallback(void * context, FFI_VortexTaskQueue queu
     static_cast<VortexBlockInputFormat *>(context)->onNotify(queue);
 }
 
-extern "C" int32_t vortexFFIChunkCallback(void * context, ::ArrowArray * array, uint64_t split_index);
-extern "C" int32_t vortexFFIChunkCallback(void * context, ::ArrowArray * array, uint64_t split_index)
+extern "C" int32_t vortexFFIChunkCallback(void * context, FFI_VortexChunk * chunk, uint64_t split_index);
+extern "C" int32_t vortexFFIChunkCallback(void * context, FFI_VortexChunk * chunk, uint64_t split_index)
 {
-    return static_cast<VortexBlockInputFormat *>(context)->onChunk(array, split_index);
+    return static_cast<VortexBlockInputFormat *>(context)->onChunk(chunk, split_index);
 }
 
 extern "C" void vortexFFIFinishCallback(void * context, const char * error);
@@ -238,54 +241,74 @@ void VortexBlockInputFormat::driveQueue(FFI_VortexTaskQueue queue, std::shared_p
     delivery_cv.notify_all();
 }
 
-int32_t VortexBlockInputFormat::onChunk(::ArrowArray * array, UInt64 split_index) noexcept
+VortexBlockInputFormat::DeliveredChunk VortexBlockInputFormat::convertChunk(FFI_VortexChunk * chunk)
+{
+    DeliveredChunk delivered_chunk;
+    delivered_chunk.holds_permit = true;
+
+    if (direct_converter)
+    {
+        delivered_chunk.missing_values = BlockMissingValues(getPort().getHeader().columns());
+        delivered_chunk.chunk = direct_converter->convert(chunk);
+        return delivered_chunk;
+    }
+
+    /// Everything below lays every value out a second time: the chunk is exported as an Arrow
+    /// array and the Arrow buffers are then copied into the columns. It is the way out for the
+    /// types `Vortex::ColumnConverter` does not cover.
+    Stopwatch decode_watch;
+    ArrowArray array{};
+    char * error = nullptr;
+    if (vortex_ffi_chunk_export_arrow(chunk, &array, &error) != 0)
+        throwVortexError(error, read_context->getException());
+    ProfileEvents::increment(ProfileEvents::VortexDecodeMicroseconds, decode_watch.elapsedMicroseconds());
+
+    Stopwatch convert_watch;
+    SCOPE_EXIT({ ProfileEvents::increment(ProfileEvents::VortexConvertMicroseconds, convert_watch.elapsedMicroseconds()); });
+
+    auto batch = arrow::ImportRecordBatch(&array, scan_schema);
+    throwFromArrowStatusIfFailed(batch.status());
+
+    ArrowColumnToCHColumn::checkRecordBatchValidityBitmaps(**batch);
+
+    std::shared_ptr<ChunkInfoRowNumbers> row_numbers_info;
+    auto data_batch = *batch;
+    if (row_index_column)
+    {
+        row_numbers_info = convertToRowNumbers(*data_batch->column(0));
+        auto removed = data_batch->RemoveColumn(0);
+        throwFromArrowStatusIfFailed(removed.status());
+        data_batch = *removed;
+    }
+
+    auto table = arrow::Table::FromRecordBatches({data_batch});
+    throwFromArrowStatusIfFailed(table.status());
+
+    auto converter = takeConverter();
+    SCOPE_EXIT({ returnConverter(std::move(converter)); });
+
+    delivered_chunk.missing_values = BlockMissingValues(getPort().getHeader().columns());
+    BlockMissingValues * missing_values_ptr = format_settings.defaults_for_omitted_fields ? &delivered_chunk.missing_values : nullptr;
+    delivered_chunk.chunk = converter->arrowTableToCHChunk(*table, (*table)->num_rows(), nullptr, missing_values_ptr);
+    if (row_numbers_info)
+        delivered_chunk.chunk.getChunkInfos().add(std::move(row_numbers_info));
+    return delivered_chunk;
+}
+
+int32_t VortexBlockInputFormat::onChunk(FFI_VortexChunk * chunk, UInt64 split_index) noexcept
 {
     try
     {
         ProfileEvents::increment(ProfileEvents::VortexScanSplits);
-        /// The library reports a fully filtered-out split as a null array.
-        if (!array)
+        /// The library reports a fully filtered-out split as a null chunk.
+        if (!chunk)
             ProfileEvents::increment(ProfileEvents::VortexScanEmptySplits);
 
         DeliveredChunk delivered_chunk;
-        delivered_chunk.empty = array == nullptr;
-        delivered_chunk.holds_permit = array != nullptr;
-
-        if (array)
-        {
-            Stopwatch convert_watch;
-            SCOPE_EXIT({ ProfileEvents::increment(ProfileEvents::VortexConvertMicroseconds, convert_watch.elapsedMicroseconds()); });
-
-            /// The array is borrowed for the duration of this callback; importing it moves the
-            /// data out and marks the struct released, which is how it is handed back.
-            auto batch = arrow::ImportRecordBatch(array, scan_schema);
-            throwFromArrowStatusIfFailed(batch.status());
-
-            ArrowColumnToCHColumn::checkRecordBatchValidityBitmaps(**batch);
-
-            std::shared_ptr<ChunkInfoRowNumbers> row_numbers_info;
-            auto data_batch = *batch;
-            if (row_index_column)
-            {
-                row_numbers_info = convertToRowNumbers(*data_batch->column(0));
-                auto removed = data_batch->RemoveColumn(0);
-                throwFromArrowStatusIfFailed(removed.status());
-                data_batch = *removed;
-            }
-
-            auto table = arrow::Table::FromRecordBatches({data_batch});
-            throwFromArrowStatusIfFailed(table.status());
-
-            auto converter = takeConverter();
-            SCOPE_EXIT({ returnConverter(std::move(converter)); });
-
-            delivered_chunk.missing_values = BlockMissingValues(getPort().getHeader().columns());
-            BlockMissingValues * missing_values_ptr
-                = format_settings.defaults_for_omitted_fields ? &delivered_chunk.missing_values : nullptr;
-            delivered_chunk.chunk = converter->arrowTableToCHChunk(*table, (*table)->num_rows(), nullptr, missing_values_ptr);
-            if (row_numbers_info)
-                delivered_chunk.chunk.getChunkInfos().add(std::move(row_numbers_info));
-        }
+        if (chunk)
+            delivered_chunk = convertChunk(chunk);
+        else
+            delivered_chunk.empty = true;
 
         {
             std::lock_guard lock(delivery_mutex);
@@ -376,6 +399,7 @@ void VortexBlockInputFormat::closeReader()
         scan_finished = false;
         background_exception = nullptr;
     }
+    direct_converter.reset();
     {
         std::lock_guard lock(converters_mutex);
         converters.clear();
@@ -529,6 +553,13 @@ void VortexBlockInputFormat::prepareReader()
     for (const auto & name : plan.column_names)
         scan_fields.push_back(file_schema->GetFieldByName(name));
     scan_schema = arrow::schema(std::move(scan_fields));
+    /// Set up before the scan starts for the same reason: the first chunk can arrive before
+    /// `vortex_ffi_scan_create` has returned.
+    direct_converter = ColumnConverter::create(getPort().getHeader(), *scan_schema, row_index_column);
+    LOG_TEST(
+        log,
+        "Vortex chunks are read {}",
+        direct_converter ? "straight into ClickHouse columns" : "through Arrow, the header having a type with no direct conversion");
 
     char * error = nullptr;
     auto * new_scan = vortex_ffi_scan_create(reader, &options, &callbacks, &error);

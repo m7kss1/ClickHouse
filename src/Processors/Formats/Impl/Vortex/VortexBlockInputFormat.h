@@ -31,13 +31,13 @@ class RandomAccessFile;
 struct FFI_VortexRuntime;
 struct FFI_VortexReader;
 struct FFI_VortexScan;
+struct FFI_VortexChunk;
 enum class FFI_VortexTaskQueue : int32_t;
-
-struct ArrowArray;
 
 namespace DB::Vortex
 {
 struct VortexReadContext;
+class ColumnConverter;
 }
 
 namespace DB
@@ -82,11 +82,11 @@ public:
     /// this reader.
     void onNotify(FFI_VortexTaskQueue queue) noexcept;
 
-    /// Converts the Arrow array a split task decoded into a `Chunk` and puts it in the delivery
-    /// queue under `split_index`, where `read` picks it up. Runs on the thread that decoded the
-    /// split. A null `array` means the split matched no rows, so there is nothing to convert.
-    /// Returns 0, or non-zero to make the library stop the scan.
-    int32_t onChunk(::ArrowArray * array, UInt64 split_index) noexcept;
+    /// Converts the columns of a split into a `Chunk` and puts it in the delivery queue under
+    /// `split_index`, where `read` picks it up. This is where the split is decoded, on the thread
+    /// that read it. A null `chunk` means the split matched no rows, so there is nothing to
+    /// convert. Returns 0, or non-zero to make the library stop the scan.
+    int32_t onChunk(FFI_VortexChunk * chunk, UInt64 split_index) noexcept;
 
     /// Records the outcome of the scan and wakes `read` so that it stops waiting for more chunks.
     /// `error` is null when the scan read the file to the end.
@@ -150,6 +150,10 @@ private:
 
     std::unique_ptr<ArrowColumnToCHColumn> createConverter() const;
 
+    /// Converts a chunk the way `direct_converter` would, or through an Arrow array when there is
+    /// none - a header with a type the direct conversion does not cover.
+    DeliveredChunk convertChunk(FFI_VortexChunk * chunk);
+
     /// Takes a converter out of the pool, creating one if the pool is empty, and returns it there
     /// afterwards. They are pooled because each caches dictionaries and cannot be used by two
     /// threads at once.
@@ -179,6 +183,11 @@ private:
     bool scan_finished TSA_GUARDED_BY(delivery_mutex) = false;
     /// Only the first failure is kept; `read` rethrows it.
     std::exception_ptr background_exception TSA_GUARDED_BY(delivery_mutex);
+
+    /// Reads the chunks straight into the block's columns. Null for a header this cannot be done
+    /// for, and then the chunks go through Arrow instead. Set up before the first task exists and
+    /// cleared after the last one has stopped, and stateless, so the tasks share the one of them.
+    std::unique_ptr<Vortex::ColumnConverter> direct_converter;
 
     std::mutex converters_mutex;
     std::vector<std::unique_ptr<ArrowColumnToCHColumn>> converters TSA_GUARDED_BY(converters_mutex);

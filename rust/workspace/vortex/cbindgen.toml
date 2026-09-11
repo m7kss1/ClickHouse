@@ -25,20 +25,26 @@ header = """
 #include <stdint.h>
 
 /// C bindings for reading and writing Vortex files, implemented in Rust on top of the `vortex`
-/// crate; the other half lives in `rust/workspace/vortex/src/lib.rs`. Arrays cross the boundary as
-/// Arrow C Data Interface structs, and IO is delegated back through callbacks.
+/// crate; the other half lives in `rust/workspace/vortex/src/lib.rs`. IO is delegated back through
+/// callbacks.
 ///
 /// THIS FILE IS GENERATED FROM `src/lib.rs` BY `generate-header.sh`. DO NOT EDIT IT BY HAND:
 /// change the Rust side, including its doc comments, and regenerate.
+///
+/// A scan delivers the columns of a split as an `FFI_VortexChunk`, in the encodings the file
+/// stores them in. `vortex_ffi_chunk_describe` decodes them and reports where the values are, so
+/// that the caller copies each of them into its own columns once; the variable-length ones are
+/// laid out by `vortex_ffi_chunk_copy_binary`, straight into the caller's memory.
+/// `vortex_ffi_chunk_export_arrow` is the other way out, as one Arrow C Data Interface struct, for
+/// the types the caller has no conversion of its own for - at the cost of laying every value out a
+/// second time. Schemas always cross as Arrow, and so do the arrays being written.
 ///
 /// Ownership:
 ///   - an Arrow struct passed into a function is consumed by it;
 ///   - an Arrow struct written to an out-parameter belongs to the caller, who has to call its
 ///     `release` - importing it with `arrow::ImportRecordBatch` or `arrow::ImportSchema` does that;
-///   - the Arrow struct passed to the scan's `on_chunk` is only borrowed for the duration of the
-///     call: the callback has to consume it before returning, by moving out of it (importing it
-///     with `arrow::ImportRecordBatch` does that) or by calling its `release`. The pointer must
-///     not be kept, and the struct must not be released after the callback has returned;
+///   - the chunk passed to the scan's `on_chunk`, and everything `vortex_ffi_chunk_describe`
+///     points at, are only borrowed for the duration of the call. The pointers must not be kept;
 ///   - an error message has to be freed with `vortex_ffi_free_string`.
 ///
 /// Every `vortex_ffi_expr_*` builder returns nullptr for input it cannot use, borrows rather than

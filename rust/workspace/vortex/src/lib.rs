@@ -1,7 +1,14 @@
-//! C bindings over the `vortex` crate for ClickHouse's `Vortex` input and output formats. Arrays
-//! cross the boundary as Arrow C Data Interface structs, and reads and writes are delegated back
-//! through callbacks, so a file is always accessed through ClickHouse's own buffers - local disk,
-//! S3, HTTP - with their throttling and accounting.
+//! C bindings over the `vortex` crate for ClickHouse's `Vortex` input and output formats. Reads
+//! and writes are delegated back through callbacks, so a file is always accessed through
+//! ClickHouse's own buffers - local disk, S3, HTTP - with their throttling and accounting.
+//!
+//! A scan delivers its chunks as `FFI_VortexChunk`: the columns of a split in the encodings the
+//! file stores them in. `vortex_ffi_chunk_describe` decodes them and reports where the values are,
+//! so that the caller writes each of them into its own columns once, and the variable-length ones
+//! are laid out in the caller's memory by `vortex_ffi_chunk_copy_binary` rather than anywhere
+//! else. `vortex_ffi_chunk_export_arrow` is the other way out, as one Arrow C Data Interface
+//! struct, for a caller with no conversion of its own for the types in the file; writing goes the
+//! same way, with Arrow arrays passed in.
 //!
 //! Nothing here owns a thread. An `FFI_VortexRuntime` is two queues of pending work plus a way to
 //! report that something became runnable; who runs it, when, and on how many threads is the
@@ -33,12 +40,19 @@ use async_task::Runnable;
 use concurrent_queue::ConcurrentQueue;
 use futures::future::BoxFuture;
 use futures::{FutureExt, StreamExt};
+use vortex::array::arrays::struct_::{StructArrayExt, StructArraySlotsExt};
+use vortex::array::arrays::varbin::VarBinArrayExt;
+use vortex::array::arrays::{PrimitiveArray, StructArray as VortexStructArray, VarBinViewArray};
 use vortex::array::buffer::BufferHandle;
-use vortex::array::VortexSessionExecute;
+use vortex::array::validity::Validity;
+use vortex::array::{ArrayRef, Canonical, VortexSessionExecute};
 use vortex::arrow::ArrowSessionExt;
 use vortex::buffer::{Alignment, Buffer, ByteBufferMut};
+use vortex::buffer::{BitBuffer, ByteBuffer};
+use vortex::dtype::PType;
 use vortex::dtype::{FieldName, Nullability};
-use vortex::error::{vortex_err, VortexResult};
+use vortex::encodings::fsst::{FSSTArrayExt, FSSTArraySlotsExt, FSST};
+use vortex::error::{vortex_bail, vortex_err, VortexResult};
 use vortex::expr::{get_item, is_null, lit, merge, not, pack, root, select, Expression};
 use vortex::extension::datetime::{Date, TimeUnit, Timestamp, TimestampOptions};
 use vortex::file::{OpenOptionsSessionExt, VortexFile, WriteOptionsSessionExt};
@@ -46,6 +60,7 @@ use vortex::io::runtime::{AbortHandle, AbortHandleRef, Executor, Handle, Task};
 use vortex::io::session::RuntimeSessionExt;
 use vortex::io::{CoalesceConfig, IoBuf, VortexReadAt, VortexWrite};
 use vortex::layout::layouts::row_idx::row_idx;
+use vortex::mask::{AllOr, Mask};
 use vortex::scalar::Scalar;
 use vortex::scalar_fn::fns::binary::Binary;
 use vortex::scalar_fn::fns::operators::Operator;
@@ -68,7 +83,7 @@ pub type FFI_VortexWriteCallback =
 #[repr(i32)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FFI_VortexTaskQueue {
-    /// Decoding, filtering and exporting to Arrow: work that needs a core.
+    /// Filtering, projecting and assembling a chunk: work that needs a core.
     CPU = 0,
     /// Work that calls the read callback and blocks until it returns.
     IO = 1,
@@ -646,11 +661,12 @@ pub struct FFI_VortexScanOptions {
     pub row_range_begin: u64,
     pub row_range_end: u64,
 
+    /// The rows to read, by their position in the file, in increasing order. Null for all of them.
     pub row_selection_begin: *const u64,
-    // 0 means the whole file
+    /// How many of them; 0 means the whole file.
     pub row_selection_len: u64,
 
-    // If true, prepend a row_idx() column to output
+    /// Whether to prepend a `row_idx()` column, giving each row its position in the file.
     pub row_index_column: bool,
 
     /// The number of splits that may be in flight at once: being read, being decoded, or already
@@ -676,15 +692,16 @@ pub struct FFI_VortexScanOptions {
 #[derive(Clone, Copy)]
 pub struct FFI_VortexScanCallbacks {
     pub context: *mut c_void,
-    /// Delivers one chunk: an Arrow struct array in the scan's schema, together with the position
-    /// of its split in the file. The array is borrowed for the duration of the call - the callback
-    /// takes the data out of it (or releases it) before returning, and must not keep the pointer.
-    /// A null array means the split matched no rows; it is reported only when
-    /// `report_empty_splits` is set, so that a caller restoring the file order can see the gap. Returning non-zero stops the scan; it is the only way `on_chunk` has
-    /// to stop it, and it surfaces from `on_finish` as an error.
+    /// Delivers one chunk: the columns of one split in the scan's schema, together with the
+    /// position of that split in the file. The chunk is borrowed for the duration of the call -
+    /// the callback reads it through `vortex_ffi_chunk_describe` or
+    /// `vortex_ffi_chunk_export_arrow` and must not keep the pointer. A null chunk means the split
+    /// matched no rows; it is reported only when `report_empty_splits` is set, so that a caller
+    /// restoring the file order can see the gap. Returning non-zero stops the scan; it is the only
+    /// way `on_chunk` has to stop it, and it surfaces from `on_finish` as an error.
     pub on_chunk: unsafe extern "C" fn(
         context: *mut c_void,
-        array: *mut FFI_ArrowArray,
+        chunk: *mut FFI_VortexChunk,
         split_index: u64,
     ) -> i32,
     /// Reports the end of the scan, exactly once: null if every split was delivered, otherwise
@@ -702,18 +719,18 @@ pub struct FFI_VortexScanCallbacks {
 #[derive(Clone, Copy)]
 struct ScanCallbacks {
     context: usize,
-    on_chunk: unsafe extern "C" fn(*mut c_void, *mut FFI_ArrowArray, u64) -> i32,
+    on_chunk: unsafe extern "C" fn(*mut c_void, *mut FFI_VortexChunk, u64) -> i32,
     on_finish: unsafe extern "C" fn(*mut c_void, *const c_char),
     report_empty_splits: bool,
 }
 
 impl ScanCallbacks {
-    fn deliver(&self, array: Option<FFI_ArrowArray>, split_index: u64) -> VortexResult<()> {
-        let empty = array.is_none();
+    fn deliver(&self, chunk: Option<FFI_VortexChunk>, split_index: u64) -> VortexResult<()> {
+        let empty = chunk.is_none();
         if empty && !self.report_empty_splits {
             return Ok(());
         }
-        let result = match array {
+        let result = match chunk {
             None => unsafe {
                 (self.on_chunk)(
                     self.context as *mut c_void,
@@ -721,13 +738,10 @@ impl ScanCallbacks {
                     split_index,
                 )
             },
-            Some(array) => {
-                // The array lives on this stack frame for the duration of the call: the callback
-                // consumes it - imports it, which moves the data out and marks the struct released,
-                // or releases it - and does not keep the pointer. It must not be released here as
-                // well, so the local is a `ManuallyDrop`.
-                let mut array = std::mem::ManuallyDrop::new(array);
-                unsafe { (self.on_chunk)(self.context as *mut c_void, &mut *array, split_index) }
+            Some(mut chunk) => {
+                // The chunk lives on this stack frame for the duration of the call and is dropped
+                // right after it: the callback only borrows it, and must not keep the pointer.
+                unsafe { (self.on_chunk)(self.context as *mut c_void, &mut chunk, split_index) }
             }
         };
         if result != 0 {
@@ -929,25 +943,20 @@ pub unsafe extern "C" fn vortex_ffi_scan_create(
                 }
             };
 
-            // The export to Arrow happens inside the split task, on the caller's thread, and is
-            // checked against the scan schema so that every chunk can be imported with the single
-            // schema `vortex_ffi_scan_schema` returns.
+            // Nothing is decoded here: the split task hands the chunk over as it comes out of the
+            // file, and whichever way the caller reads it - column by column into its own memory,
+            // or as one Arrow array - runs inside `on_chunk`, on the thread that ran the split.
+            // The struct field is the scan's schema as one Arrow type, which is what an export
+            // has to produce for every chunk to be importable with the single schema
+            // `vortex_ffi_scan_schema` returns.
             let session = reader.session.clone();
-            let struct_field = Field::new_struct("", schema.fields().clone(), false);
-            let expected_type = struct_field.data_type().clone();
+            let struct_field = Arc::new(Field::new_struct("", schema.fields().clone(), false));
             let builder = builder.map(move |chunk| {
-                let mut ctx = session.create_execution_ctx();
-                let arrow = session
-                    .arrow()
-                    .execute_arrow(chunk, Some(&struct_field), &mut ctx)?;
-                if arrow.data_type() != &expected_type {
-                    return Err(vortex_err!(
-                        "Vortex chunk exported as {} instead of the scan schema {}",
-                        arrow.data_type(),
-                        expected_type
-                    ));
-                }
-                Ok(FFI_ArrowArray::new(&arrow.as_struct().to_data()))
+                Ok(FFI_VortexChunk::new(
+                    session.clone(),
+                    struct_field.clone(),
+                    chunk,
+                ))
             });
 
             // `into_stream` and `into_iter` are on offer and are not what we want: they give back
@@ -1006,7 +1015,7 @@ pub unsafe extern "C" fn vortex_ffi_scan_create(
                     let permits = permits_for_tasks.clone();
                     let task = spawner.spawn(async move {
                         match task.await {
-                            Ok(Some(array)) => callbacks.deliver(Some(array), split_index),
+                            Ok(Some(chunk)) => callbacks.deliver(Some(chunk), split_index),
                             Ok(None) => {
                                 // Nothing was delivered, so the permit is returned here.
                                 let result = callbacks.deliver(None, split_index);
@@ -1099,6 +1108,520 @@ pub unsafe extern "C" fn vortex_ffi_scan_cancel(scan: *const FFI_VortexScan) {
 pub unsafe extern "C" fn vortex_ffi_scan_free(scan: *mut FFI_VortexScan) {
     if !scan.is_null() {
         unsafe { drop(Box::from_raw(scan)) };
+    }
+}
+
+/// The canonical form of one column of a chunk, as `vortex_ffi_chunk_describe` reports it.
+#[repr(i32)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FFI_VortexArrayKind {
+    /// `length` fixed-width values of `ptype`, end to end in `values`.
+    Primitive = 0,
+    /// `length` bits in `values`, the first of them at `values_bit_offset`.
+    Bool = 1,
+    /// Variable-length values. They are the one kind that is not read out of the chunk directly:
+    /// `vortex_ffi_chunk_copy_binary` lays them out in the caller's own memory, which is what
+    /// keeps them from being laid out twice on the way there.
+    Binary = 2,
+}
+
+/// One column of a chunk, as `vortex_ffi_chunk_describe` fills it in. Every pointer is into the
+/// chunk and dies with it.
+#[repr(C)]
+pub struct FFI_VortexColumnView {
+    pub kind: FFI_VortexArrayKind,
+    /// `Primitive` only.
+    pub ptype: FFI_VortexPrimitiveType,
+    pub length: u64,
+    /// One bit per row, least significant bit first, set where the row is not null. Null when no
+    /// row of the column is - which is all a non-nullable column ever reports.
+    pub validity: *const u8,
+    /// Where in `validity` the first row's bit is.
+    pub validity_bit_offset: u64,
+    /// `Primitive`: the values. `Bool`: the bits. Null for `Binary`.
+    pub values: *const u8,
+    /// `Bool` only: where in `values` the first row's bit is.
+    pub values_bit_offset: u64,
+    /// `Binary` only: what all the column's values take together, which is the room
+    /// `vortex_ffi_chunk_copy_binary` has to be given.
+    pub total_value_bytes: u64,
+}
+
+/// One chunk of a scan: the columns of one split, in whatever encodings the file stores them in,
+/// alive only for the duration of the `on_chunk` call it is passed to.
+///
+/// `vortex_ffi_chunk_describe` decodes them into their canonical encodings and reports where the
+/// values are, so that the caller writes each of them into its own columns once instead of through
+/// an Arrow array in between. `vortex_ffi_chunk_export_arrow` is the other way out, for the types
+/// the caller has no conversion of its own for.
+pub struct FFI_VortexChunk {
+    session: VortexSession,
+    /// The scan's schema as one non-nullable struct field: what `export_arrow` exports with, and
+    /// what it holds the result to.
+    struct_field: Arc<Field>,
+    array: ArrayRef,
+    /// Decoded by `describe`; empty until it has run.
+    columns: Vec<ChunkColumn>,
+}
+
+/// A column of a chunk once `describe` has decoded it. Holding the decoded arrays is what keeps
+/// the pointers in `FFI_VortexColumnView` valid for as long as the chunk is.
+struct ChunkColumn {
+    values: ChunkColumnValues,
+    validity: ChunkColumnValidity,
+    length: u64,
+}
+
+/// Which rows of a column are not null. Kept as a buffer this owns rather than as the `Mask` it
+/// came from, because a mask that is all false has no buffer to point the caller at and would
+/// have to make one that dies with the call.
+enum ChunkColumnValidity {
+    /// No row is null, which is the only thing a non-nullable column can be.
+    AllValid,
+    /// One bit per row, set where the row is not null.
+    Bits(BitBuffer),
+}
+
+impl ChunkColumnValidity {
+    fn new(mask: &Mask) -> Self {
+        // A nullable column whose rows all happen to be present can still arrive as a bitmap with
+        // every bit set. Reporting it as one would have the caller build a null map of zeroes for
+        // nothing, so what is reported is whether there is a null, not whether there is a bitmap.
+        if mask.all_true() {
+            return Self::AllValid;
+        }
+        match mask.bit_buffer() {
+            AllOr::All => Self::AllValid,
+            AllOr::None => Self::Bits(BitBuffer::new_unset(mask.len())),
+            AllOr::Some(bits) => Self::Bits(bits.clone()),
+        }
+    }
+}
+
+enum ChunkColumnValues {
+    Primitive(PrimitiveArray),
+    Bool(BitBuffer),
+    Binary {
+        array: VarBinViewArray,
+        total_value_bytes: u64,
+    },
+    /// Variable-length values still in the form the file stores them in. Decompressing them writes
+    /// the whole column into the caller's own buffer in one pass, and that is the only place they
+    /// are ever written: canonicalizing first would put them in a buffer of Vortex's own, point
+    /// views at it, and leave the caller to gather them back out.
+    Fsst {
+        array: ArrayRef,
+        /// The codes of exactly this array's rows, which is what decompresses into the column.
+        codes: ByteBuffer,
+        /// The decompressed size of each row, zero where the row is null.
+        lengths: PrimitiveArray,
+        total_value_bytes: u64,
+    },
+}
+
+/// Sums the decompressed sizes of an FSST column's rows. They are stored as whichever integer type
+/// is narrow enough to hold the longest of them.
+fn sum_lengths(lengths: &PrimitiveArray) -> VortexResult<u64> {
+    fn sum<T: Copy + Into<u64>>(values: &[T]) -> u64 {
+        values.iter().map(|value| (*value).into()).sum()
+    }
+    Ok(match lengths.ptype() {
+        PType::U8 => sum(lengths.as_slice::<u8>()),
+        PType::U16 => sum(lengths.as_slice::<u16>()),
+        PType::U32 => sum(lengths.as_slice::<u32>()),
+        PType::U64 => sum(lengths.as_slice::<u64>()),
+        other => vortex_bail!("an FSST column stores its value lengths as {other}"),
+    })
+}
+
+/// Writes the offset each row of an FSST column ends at into `offsets`, which the caller owns.
+fn write_fsst_offsets(lengths: &PrimitiveArray, offsets: *mut u64) -> VortexResult<()> {
+    fn write<T: Copy + Into<u64>>(values: &[T], offsets: *mut u64) {
+        let mut end = 0u64;
+        for (index, value) in values.iter().enumerate() {
+            end += (*value).into();
+            unsafe { std::ptr::write(offsets.add(index), end) };
+        }
+    }
+    match lengths.ptype() {
+        PType::U8 => write(lengths.as_slice::<u8>(), offsets),
+        PType::U16 => write(lengths.as_slice::<u16>(), offsets),
+        PType::U32 => write(lengths.as_slice::<u32>(), offsets),
+        PType::U64 => write(lengths.as_slice::<u64>(), offsets),
+        other => vortex_bail!("an FSST column stores its value lengths as {other}"),
+    }
+    Ok(())
+}
+
+fn ffi_ptype(ptype: PType) -> Result<FFI_VortexPrimitiveType, String> {
+    Ok(match ptype {
+        PType::I8 => FFI_VortexPrimitiveType::I8,
+        PType::I16 => FFI_VortexPrimitiveType::I16,
+        PType::I32 => FFI_VortexPrimitiveType::I32,
+        PType::I64 => FFI_VortexPrimitiveType::I64,
+        PType::U8 => FFI_VortexPrimitiveType::U8,
+        PType::U16 => FFI_VortexPrimitiveType::U16,
+        PType::U32 => FFI_VortexPrimitiveType::U32,
+        PType::U64 => FFI_VortexPrimitiveType::U64,
+        PType::F32 => FFI_VortexPrimitiveType::F32,
+        PType::F64 => FFI_VortexPrimitiveType::F64,
+        other => {
+            return Err(format!(
+                "a Vortex column has the primitive type {other}, which has no ClickHouse column to be read into directly"
+            ))
+        }
+    })
+}
+
+impl FFI_VortexChunk {
+    fn new(session: VortexSession, struct_field: Arc<Field>, array: ArrayRef) -> Self {
+        Self {
+            session,
+            struct_field,
+            array,
+            columns: Vec::new(),
+        }
+    }
+
+    /// Decodes every column into its canonical encoding, once.
+    fn decode(&mut self) -> VortexResult<()> {
+        if !self.columns.is_empty() {
+            return Ok(());
+        }
+
+        let mut ctx = self.session.create_execution_ctx();
+        let fields = self.array.clone().execute::<VortexStructArray>(&mut ctx)?;
+        // The scan's struct is non-nullable - a chunk is rows of a file, not an optional value -
+        // so the fields carry all the validity there is and can be taken as they are.
+        if !matches!(fields.struct_validity(), Validity::NonNullable) {
+            vortex_bail!("a Vortex chunk arrived as a nullable struct");
+        }
+
+        let nfields = fields.fields().len();
+        self.columns.reserve(nfields);
+        for index in 0..nfields {
+            let field = fields.unmasked_field(index).clone();
+            let length = field.len();
+            let validity =
+                ChunkColumnValidity::new(&field.validity()?.execute_mask(length, &mut ctx)?);
+            let length = length as u64;
+            if let Some(fsst) = field.as_opt::<FSST>() {
+                let codes = fsst.codes().sliced_bytes();
+                let lengths = fsst
+                    .uncompressed_lengths()
+                    .clone()
+                    .execute::<PrimitiveArray>(&mut ctx)?;
+                let total_value_bytes = sum_lengths(&lengths)?;
+                if lengths.len() as u64 != length {
+                    vortex_bail!(
+                        "an FSST column of {length} rows has {} value lengths",
+                        lengths.len()
+                    );
+                }
+                self.columns.push(ChunkColumn {
+                    values: ChunkColumnValues::Fsst {
+                        array: field,
+                        codes,
+                        lengths,
+                        total_value_bytes,
+                    },
+                    validity,
+                    length,
+                });
+                continue;
+            }
+            let values = match field.execute::<Canonical>(&mut ctx)? {
+                Canonical::Primitive(array) => ChunkColumnValues::Primitive(array),
+                Canonical::Bool(array) => ChunkColumnValues::Bool(array.into_bit_buffer()),
+                Canonical::VarBinView(array) => {
+                    let total_value_bytes = array
+                        .views()
+                        .iter()
+                        .map(|view| u64::from(view.len()))
+                        .sum();
+                    ChunkColumnValues::Binary {
+                        array,
+                        total_value_bytes,
+                    }
+                }
+                other => vortex_bail!(
+                    "a Vortex chunk column canonicalized to {}, which has no ClickHouse column to be read into directly",
+                    other.dtype()
+                ),
+            };
+            self.columns.push(ChunkColumn {
+                values,
+                validity,
+                length,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// The number of rows in the chunk, which is the length of each of its columns.
+#[no_mangle]
+pub unsafe extern "C" fn vortex_ffi_chunk_row_count(chunk: *const FFI_VortexChunk) -> u64 {
+    unsafe { (*chunk).array.len() as u64 }
+}
+
+/// Decodes the chunk and describes its columns into `out`, which has to have room for
+/// `num_columns` of them - the columns of the scan's schema, in that order. Returns zero on
+/// success, and the views stay valid until `on_chunk` returns.
+#[no_mangle]
+pub unsafe extern "C" fn vortex_ffi_chunk_describe(
+    chunk: *mut FFI_VortexChunk,
+    out: *mut FFI_VortexColumnView,
+    num_columns: u64,
+    error: *mut *mut c_char,
+) -> i32 {
+    unsafe {
+        ffi_wrap(error, -1, || {
+            let chunk = &mut *chunk;
+            chunk.decode().map_err(|e| e.to_string())?;
+            if chunk.columns.len() as u64 != num_columns {
+                return Err(format!(
+                    "the Vortex chunk has {} columns, not the {num_columns} of the scan's schema",
+                    chunk.columns.len()
+                ));
+            }
+            for (index, column) in chunk.columns.iter().enumerate() {
+                std::ptr::write(out.add(index), column.describe()?);
+            }
+            Ok(0)
+        })
+    }
+}
+
+/// Writes the values of the `Binary` column `column` into the caller's own memory: the bytes of
+/// the values, end to end, into `chars`, and the offset each of them ends at into `offsets`. A
+/// null row contributes no bytes. `offsets` has to have room for the column's `length`, and
+/// `chars_capacity` is how many bytes may be written at `chars` - at least the column's
+/// `total_value_bytes`, and anything beyond that is scratch the decoder may use and the caller
+/// must not read. Returns zero on success.
+#[no_mangle]
+pub unsafe extern "C" fn vortex_ffi_chunk_copy_binary(
+    chunk: *const FFI_VortexChunk,
+    column: u64,
+    chars: *mut u8,
+    chars_capacity: u64,
+    offsets: *mut u64,
+    error: *mut *mut c_char,
+) -> i32 {
+    unsafe {
+        ffi_wrap(error, -1, || {
+            let chunk = &*chunk;
+            let index = column;
+            let column = chunk
+                .columns
+                .get(index as usize)
+                .ok_or_else(|| format!("the Vortex chunk has no column {index}"))?;
+            let total_value_bytes = match &column.values {
+                ChunkColumnValues::Binary {
+                    total_value_bytes, ..
+                }
+                | ChunkColumnValues::Fsst {
+                    total_value_bytes, ..
+                } => *total_value_bytes,
+                _ => return Err("the Vortex chunk column is not a variable-length one".to_string()),
+            };
+            if chars_capacity < total_value_bytes {
+                return Err(format!(
+                    "the Vortex chunk column needs {total_value_bytes} bytes, and was given {chars_capacity}"
+                ));
+            }
+            if column.length == 0 {
+                return Ok(0);
+            }
+            match &column.values {
+                ChunkColumnValues::Binary { array, .. } => {
+                    copy_binary_values(array, chars, offsets)
+                }
+                ChunkColumnValues::Fsst {
+                    array,
+                    codes,
+                    lengths,
+                    ..
+                } => decompress_fsst_values(
+                    array,
+                    codes,
+                    lengths,
+                    total_value_bytes,
+                    chars,
+                    chars_capacity,
+                    offsets,
+                )
+                .map_err(|e| e.to_string())?,
+                _ => unreachable!("checked above"),
+            }
+            Ok(0)
+        })
+    }
+}
+
+/// Exports the chunk as one Arrow struct array into `out_array`, which the caller then owns and
+/// has to release. This is the way out for the types the caller has no direct conversion for; it
+/// lays every value out a second time, which is what `describe` exists to avoid. Returns zero on
+/// success.
+#[no_mangle]
+pub unsafe extern "C" fn vortex_ffi_chunk_export_arrow(
+    chunk: *const FFI_VortexChunk,
+    out_array: *mut FFI_ArrowArray,
+    error: *mut *mut c_char,
+) -> i32 {
+    unsafe {
+        ffi_wrap(error, -1, || {
+            let chunk = &*chunk;
+            let mut ctx = chunk.session.create_execution_ctx();
+            let arrow = chunk
+                .session
+                .arrow()
+                .execute_arrow(chunk.array.clone(), Some(&chunk.struct_field), &mut ctx)
+                .map_err(|e| e.to_string())?;
+            let expected = chunk.struct_field.data_type();
+            if arrow.data_type() != expected {
+                return Err(format!(
+                    "Vortex chunk exported as {} instead of the scan schema {expected}",
+                    arrow.data_type()
+                ));
+            }
+            std::ptr::write(out_array, FFI_ArrowArray::new(&arrow.as_struct().to_data()));
+            Ok(0)
+        })
+    }
+}
+
+impl ChunkColumn {
+    fn describe(&self) -> Result<FFI_VortexColumnView, String> {
+        let (validity, validity_bit_offset) = match &self.validity {
+            ChunkColumnValidity::AllValid => (std::ptr::null(), 0),
+            ChunkColumnValidity::Bits(bits) => (bits.inner().as_ptr(), bits.offset() as u64),
+        };
+
+        let mut view = FFI_VortexColumnView {
+            kind: FFI_VortexArrayKind::Primitive,
+            ptype: FFI_VortexPrimitiveType::I8,
+            length: self.length,
+            validity,
+            validity_bit_offset,
+            values: std::ptr::null(),
+            values_bit_offset: 0,
+            total_value_bytes: 0,
+        };
+
+        // The caller reads `length` values straight out of the buffers below, so a buffer too
+        // short for them would send it past the end. The file says how long each of them is and a
+        // corrupt one can say anything, which is why this is checked rather than assumed.
+        if let ChunkColumnValidity::Bits(bits) = &self.validity {
+            if (bits.len() as u64) < self.length {
+                return Err(format!(
+                    "a Vortex chunk column of {} rows has {} validity bits",
+                    self.length,
+                    bits.len()
+                ));
+            }
+        }
+
+        match &self.values {
+            ChunkColumnValues::Primitive(array) => {
+                view.ptype = ffi_ptype(array.ptype())?;
+                let bytes = array
+                    .buffer_handle()
+                    .as_host_opt()
+                    .ok_or("a Vortex chunk column is not in host memory")?;
+                let needed = self.length * u64::from(array.ptype().byte_width() as u32);
+                if (bytes.len() as u64) < needed {
+                    return Err(format!(
+                        "a Vortex chunk column of {} rows of {} needs {needed} bytes, and has {}",
+                        self.length,
+                        array.ptype(),
+                        bytes.len()
+                    ));
+                }
+                view.values = bytes.as_ptr();
+            }
+            ChunkColumnValues::Bool(bits) => {
+                if (bits.len() as u64) < self.length {
+                    return Err(format!(
+                        "a Vortex chunk column of {} rows has {} bits",
+                        self.length,
+                        bits.len()
+                    ));
+                }
+                view.kind = FFI_VortexArrayKind::Bool;
+                view.values = bits.inner().as_ptr();
+                view.values_bit_offset = bits.offset() as u64;
+            }
+            ChunkColumnValues::Binary {
+                total_value_bytes, ..
+            }
+            | ChunkColumnValues::Fsst {
+                total_value_bytes, ..
+            } => {
+                view.kind = FFI_VortexArrayKind::Binary;
+                view.total_value_bytes = *total_value_bytes;
+            }
+        }
+        Ok(view)
+    }
+}
+
+/// Decompresses a whole FSST column into `chars`, writing the offset each of its values ends at to
+/// `offsets`. The decoder emits the values end to end, which is the layout the caller asked for,
+/// so this is the only time they are written.
+fn decompress_fsst_values(
+    array: &ArrayRef,
+    codes: &ByteBuffer,
+    lengths: &PrimitiveArray,
+    total_value_bytes: u64,
+    chars: *mut u8,
+    chars_capacity: u64,
+    offsets: *mut u64,
+) -> VortexResult<()> {
+    let fsst = array
+        .as_opt::<FSST>()
+        .ok_or_else(|| vortex_err!("the Vortex chunk column is no longer FSST-encoded"))?;
+    // The decoder emits whole symbols, so it only uses its wide-store loop while eight bytes are
+    // left; the scratch past `total_value_bytes` is what lets that loop run through the last
+    // value. It never stores past the slice it is given.
+    // A column of nothing but empty and null values has no bytes, and then the caller's buffer was
+    // never allocated: there is nowhere to write, and nothing to write there.
+    if total_value_bytes != 0 {
+        let out = unsafe {
+            std::slice::from_raw_parts_mut(
+                chars.cast::<std::mem::MaybeUninit<u8>>(),
+                chars_capacity as usize,
+            )
+        };
+        let written = fsst.decompressor().decompress_into(codes.as_slice(), out);
+        if written as u64 != total_value_bytes {
+            vortex_bail!(
+                "an FSST column decoded {written} bytes, and its lengths add up to {total_value_bytes}"
+            );
+        }
+    }
+    write_fsst_offsets(lengths, offsets)
+}
+
+/// Lays the values of a `VarBinView` array out end to end in `chars`, writing the offset each of
+/// them ends at to `offsets`. The caller owns both.
+fn copy_binary_values(array: &VarBinViewArray, chars: *mut u8, offsets: *mut u64) {
+    let buffers: Vec<&[u8]> = (0..array.data_buffers().len())
+        .map(|index| array.buffer(index).as_slice())
+        .collect();
+
+    let mut written = 0usize;
+    for (index, view) in array.views().iter().enumerate() {
+        let value = view.bytes(&buffers);
+        // A view of no bytes still has a pointer that must not be dereferenced, and `copy` on an
+        // empty range is not enough to promise that it will not be.
+        if !value.is_empty() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(value.as_ptr(), chars.add(written), value.len())
+            };
+        }
+        written += value.len();
+        unsafe { std::ptr::write(offsets.add(index), written as u64) };
     }
 }
 
@@ -1804,18 +2327,14 @@ mod tests {
 
     unsafe extern "C" fn test_on_chunk(
         context: *mut c_void,
-        array: *mut FFI_ArrowArray,
+        chunk: *mut FFI_VortexChunk,
         split_index: u64,
     ) -> i32 {
         let consumer = unsafe { &*(context as *const TestConsumer) };
-        // Rejecting a chunk does not hand it back: releasing it is still on us.
         if consumer.fail_all || consumer.fail_on_split == Some(split_index) {
-            if !array.is_null() {
-                drop(unsafe { std::ptr::read(array) });
-            }
             return 1;
         }
-        if array.is_null() {
+        if chunk.is_null() {
             return 0;
         }
         let outstanding = consumer.outstanding.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1830,7 +2349,15 @@ mod tests {
             .clone()
             .expect("schema is set before the scan starts");
         let ffi_schema = FFI_ArrowSchema::try_from(schema.as_ref()).expect("schema");
-        let data = from_ffi(unsafe { std::ptr::read(array) }, &ffi_schema).expect("from_ffi");
+        let mut array = std::mem::MaybeUninit::<FFI_ArrowArray>::uninit();
+        let mut error: *mut c_char = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { vortex_ffi_chunk_export_arrow(chunk, array.as_mut_ptr(), &mut error) },
+            0,
+            "export failed: {:?}",
+            unsafe { CStr::from_ptr(error) }
+        );
+        let data = from_ffi(unsafe { array.assume_init() }, &ffi_schema).expect("from_ffi");
         let batch = RecordBatch::from(StructArray::from(data));
         consumer
             .chunks
@@ -2605,6 +3132,157 @@ mod tests {
             vortex_ffi_reader_free(reader);
         }
     }
+    /// Reads the chunks of a scan the way `Vortex::ColumnConverter` does, rather than through
+    /// Arrow: describes each one and copies the values out into ClickHouse-shaped columns.
+    #[derive(Default)]
+    struct DirectConsumer {
+        ids: Mutex<Vec<i64>>,
+        names: Mutex<Vec<Option<String>>>,
+        finished: Mutex<Option<Option<String>>>,
+    }
+
+    unsafe extern "C" fn direct_on_chunk(
+        context: *mut c_void,
+        chunk: *mut FFI_VortexChunk,
+        _split_index: u64,
+    ) -> i32 {
+        let consumer = unsafe { &*(context as *const DirectConsumer) };
+        if chunk.is_null() {
+            return 0;
+        }
+
+        let mut views: [std::mem::MaybeUninit<FFI_VortexColumnView>; 2] = [
+            std::mem::MaybeUninit::uninit(),
+            std::mem::MaybeUninit::uninit(),
+        ];
+        let mut error: *mut c_char = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { vortex_ffi_chunk_describe(chunk, views.as_mut_ptr().cast(), 2, &mut error) },
+            0,
+            "describe failed: {:?}",
+            unsafe { CStr::from_ptr(error) }
+        );
+        let views = unsafe { [views[0].assume_init_ref(), views[1].assume_init_ref()] };
+        let rows = unsafe { vortex_ffi_chunk_row_count(chunk) } as usize;
+
+        // The `id` column: fixed-width values the caller copies straight out.
+        assert_eq!(views[0].kind, FFI_VortexArrayKind::Primitive);
+        assert!(matches!(views[0].ptype, FFI_VortexPrimitiveType::I64));
+        assert!(views[0].validity.is_null(), "`id` is not nullable");
+        assert_eq!(views[0].length as usize, rows);
+        let ids = unsafe { std::slice::from_raw_parts(views[0].values.cast::<i64>(), rows) };
+        consumer.ids.lock().expect("lock").extend_from_slice(ids);
+
+        // The `name` column: the library lays the values out in the caller's own buffers.
+        assert_eq!(views[1].kind, FFI_VortexArrayKind::Binary);
+        let mut chars = vec![0u8; views[1].total_value_bytes as usize + 64];
+        let mut offsets = vec![0u64; rows];
+        assert_eq!(
+            unsafe {
+                vortex_ffi_chunk_copy_binary(
+                    chunk,
+                    1,
+                    chars.as_mut_ptr(),
+                    chars.len() as u64,
+                    offsets.as_mut_ptr(),
+                    &mut error,
+                )
+            },
+            0,
+            "copy failed: {:?}",
+            unsafe { CStr::from_ptr(error) }
+        );
+        let mut names = consumer.names.lock().expect("lock");
+        for row in 0..rows {
+            let valid = views[1].validity.is_null() || {
+                let bit = views[1].validity_bit_offset as usize + row;
+                let byte = unsafe { *views[1].validity.add(bit / 8) };
+                (byte >> (bit % 8)) & 1 == 1
+            };
+            let begin = if row == 0 { 0 } else { offsets[row - 1] } as usize;
+            let end = offsets[row] as usize;
+            names
+                .push(valid.then(|| String::from_utf8(chars[begin..end].to_vec()).expect("utf-8")));
+        }
+        0
+    }
+
+    unsafe extern "C" fn direct_on_finish(context: *mut c_void, error: *const c_char) {
+        let consumer = unsafe { &*(context as *const DirectConsumer) };
+        let message = if error.is_null() {
+            None
+        } else {
+            Some(
+                unsafe { CStr::from_ptr(error) }
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        };
+        *consumer.finished.lock().expect("lock") = Some(message);
+    }
+
+    /// The direct path gives back exactly what was written: the values of a fixed-width column
+    /// copied straight out of the chunk, and the values of a string column laid out in the
+    /// caller's own buffers, nulls and all. This is what the ClickHouse reader does with a chunk.
+    #[test]
+    fn ffi_chunk_read_without_arrow() {
+        let file = unsafe {
+            write_file(vec![
+                test_batch(vec![1, 2, 3], vec![Some("a"), None, Some("a longer value")]),
+                test_batch(vec![4, 5], vec![Some(""), Some("e")]),
+            ])
+        };
+
+        let host = TestHost::new(2);
+        let mut test_file = TestFile::new(file);
+        let consumer = Arc::new(DirectConsumer::default());
+        unsafe {
+            let reader = open_reader(host.runtime(), &mut test_file, &reader_options(1, None));
+            let options = scan_options();
+            let callbacks = FFI_VortexScanCallbacks {
+                context: Arc::as_ptr(&consumer) as *mut c_void,
+                on_chunk: direct_on_chunk,
+                on_finish: direct_on_finish,
+            };
+            let mut error: *mut c_char = std::ptr::null_mut();
+            let scan = vortex_ffi_scan_create(reader, &options, &callbacks, &mut error);
+            assert!(!scan.is_null(), "{:?}", CStr::from_ptr(error));
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                vortex_ffi_scan_release(scan, 1);
+                if consumer.finished.lock().expect("lock").is_some() {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the scan did not finish"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert_eq!(*consumer.finished.lock().expect("lock"), Some(None));
+            vortex_ffi_scan_free(scan);
+            vortex_ffi_reader_free(reader);
+        }
+
+        let mut ids = consumer.ids.lock().expect("lock").clone();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 2, 3, 4, 5]);
+
+        let mut names = consumer.names.lock().expect("lock").clone();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                None,
+                Some(String::new()),
+                Some("a".to_string()),
+                Some("a longer value".to_string()),
+                Some("e".to_string()),
+            ]
+        );
+    }
+
     /// The header is generated from this file by `generate-header.sh`, so their signatures cannot
     /// drift apart. What regeneration cannot catch on its own is forgetting to run it: this checks
     /// that the committed header still declares exactly the functions this file exports.

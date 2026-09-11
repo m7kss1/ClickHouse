@@ -3,20 +3,26 @@
 #include <stdint.h>
 
 /// C bindings for reading and writing Vortex files, implemented in Rust on top of the `vortex`
-/// crate; the other half lives in `rust/workspace/vortex/src/lib.rs`. Arrays cross the boundary as
-/// Arrow C Data Interface structs, and IO is delegated back through callbacks.
+/// crate; the other half lives in `rust/workspace/vortex/src/lib.rs`. IO is delegated back through
+/// callbacks.
 ///
 /// THIS FILE IS GENERATED FROM `src/lib.rs` BY `generate-header.sh`. DO NOT EDIT IT BY HAND:
 /// change the Rust side, including its doc comments, and regenerate.
+///
+/// A scan delivers the columns of a split as an `FFI_VortexChunk`, in the encodings the file
+/// stores them in. `vortex_ffi_chunk_describe` decodes them and reports where the values are, so
+/// that the caller copies each of them into its own columns once; the variable-length ones are
+/// laid out by `vortex_ffi_chunk_copy_binary`, straight into the caller's memory.
+/// `vortex_ffi_chunk_export_arrow` is the other way out, as one Arrow C Data Interface struct, for
+/// the types the caller has no conversion of its own for - at the cost of laying every value out a
+/// second time. Schemas always cross as Arrow, and so do the arrays being written.
 ///
 /// Ownership:
 ///   - an Arrow struct passed into a function is consumed by it;
 ///   - an Arrow struct written to an out-parameter belongs to the caller, who has to call its
 ///     `release` - importing it with `arrow::ImportRecordBatch` or `arrow::ImportSchema` does that;
-///   - the Arrow struct passed to the scan's `on_chunk` is only borrowed for the duration of the
-///     call: the callback has to consume it before returning, by moving out of it (importing it
-///     with `arrow::ImportRecordBatch` does that) or by calling its `release`. The pointer must
-///     not be kept, and the struct must not be released after the callback has returned;
+///   - the chunk passed to the scan's `on_chunk`, and everything `vortex_ffi_chunk_describe`
+///     points at, are only borrowed for the duration of the call. The pointers must not be kept;
 ///   - an error message has to be freed with `vortex_ffi_free_string`.
 ///
 /// Every `vortex_ffi_expr_*` builder returns nullptr for input it cannot use, borrows rather than
@@ -68,6 +74,19 @@ struct ArrowArray
 #endif // ARROW_C_DATA_INTERFACE
 
 
+/// The canonical form of one column of a chunk, as `vortex_ffi_chunk_describe` reports it.
+enum class FFI_VortexArrayKind : int32_t
+{
+    /// `length` fixed-width values of `ptype`, end to end in `values`.
+    Primitive = 0,
+    /// `length` bits in `values`, the first of them at `values_bit_offset`.
+    Bool = 1,
+    /// Variable-length values. They are the one kind that is not read out of the chunk directly:
+    /// `vortex_ffi_chunk_copy_binary` lays them out in the caller's own memory, which is what
+    /// keeps them from being laid out twice on the way there.
+    Binary = 2,
+};
+
 /// The operator of `vortex_ffi_expr_compare`.
 enum class FFI_VortexComparisonOperator : int32_t
 {
@@ -98,7 +117,7 @@ enum class FFI_VortexPrimitiveType : int32_t
 /// The queue a task waits in.
 enum class FFI_VortexTaskQueue : int32_t
 {
-    /// Decoding, filtering and exporting to Arrow: work that needs a core.
+    /// Filtering, projecting and assembling a chunk: work that needs a core.
     CPU = 0,
     /// Work that calls the read callback and blocks until it returns.
     IO = 1,
@@ -113,6 +132,15 @@ enum class FFI_VortexTimeUnit : int32_t
     Seconds = 3,
     Days = 4,
 };
+
+/// One chunk of a scan: the columns of one split, in whatever encodings the file stores them in,
+/// alive only for the duration of the `on_chunk` call it is passed to.
+///
+/// `vortex_ffi_chunk_describe` decodes them into their canonical encodings and reports where the
+/// values are, so that the caller writes each of them into its own columns once instead of through
+/// an Arrow array in between. `vortex_ffi_chunk_export_arrow` is the other way out, for the types
+/// the caller has no conversion of its own for.
+struct FFI_VortexChunk;
 
 struct FFI_VortexExpression;
 
@@ -160,13 +188,12 @@ struct FFI_VortexScanOptions
     /// The row range `[row_range_begin, row_range_end)`. Both zero means the whole file.
     uint64_t row_range_begin;
     uint64_t row_range_end;
-
-    const uint64_t* row_selection_begin;
+    /// The rows to read, by their position in the file, in increasing order. Null for all of them.
+    const uint64_t *row_selection_begin;
+    /// How many of them; 0 means the whole file.
     uint64_t row_selection_len;
-
-    /// If true, prepend a row_idx() column to output
+    /// Whether to prepend a `row_idx()` column, giving each row its position in the file.
     bool row_index_column;
-
     /// The number of splits that may be in flight at once: being read, being decoded, or already
     /// handed over and not yet released. 0 selects the default. This is what keeps the scan from
     /// running ahead of the caller; the reads underneath are bounded separately by
@@ -188,13 +215,14 @@ struct FFI_VortexScanOptions
 struct FFI_VortexScanCallbacks
 {
     void *context;
-    /// Delivers one chunk: an Arrow struct array in the scan's schema, together with the position
-    /// of its split in the file. The array is borrowed for the duration of the call - the callback
-    /// takes the data out of it (or releases it) before returning, and must not keep the pointer.
-    /// A null array means the split matched no rows; it is reported only when
-    /// `report_empty_splits` is set, so that a caller restoring the file order can see the gap. Returning non-zero stops the scan; it is the only way `on_chunk` has
-    /// to stop it, and it surfaces from `on_finish` as an error.
-    int32_t (*on_chunk)(void *context, ArrowArray *array, uint64_t split_index);
+    /// Delivers one chunk: the columns of one split in the scan's schema, together with the
+    /// position of that split in the file. The chunk is borrowed for the duration of the call -
+    /// the callback reads it through `vortex_ffi_chunk_describe` or
+    /// `vortex_ffi_chunk_export_arrow` and must not keep the pointer. A null chunk means the split
+    /// matched no rows; it is reported only when `report_empty_splits` is set, so that a caller
+    /// restoring the file order can see the gap. Returning non-zero stops the scan; it is the only
+    /// way `on_chunk` has to stop it, and it surfaces from `on_finish` as an error.
+    int32_t (*on_chunk)(void *context, FFI_VortexChunk *chunk, uint64_t split_index);
     /// Reports the end of the scan, exactly once: null if every split was delivered, otherwise
     /// a message that is only valid for the duration of the call. Every other outcome - a failed
     /// split, a non-zero return from `on_chunk`, a panic in the driver - is reported here; the one
@@ -203,6 +231,28 @@ struct FFI_VortexScanCallbacks
     /// failure a split task already in flight can still reach `on_chunk`, so the context has to
     /// outlive the caller's last pass over the queues.
     void (*on_finish)(void *context, const char *error);
+};
+
+/// One column of a chunk, as `vortex_ffi_chunk_describe` fills it in. Every pointer is into the
+/// chunk and dies with it.
+struct FFI_VortexColumnView
+{
+    FFI_VortexArrayKind kind;
+    /// `Primitive` only.
+    FFI_VortexPrimitiveType ptype;
+    uint64_t length;
+    /// One bit per row, least significant bit first, set where the row is not null. Null when no
+    /// row of the column is - which is all a non-nullable column ever reports.
+    const uint8_t *validity;
+    /// Where in `validity` the first row's bit is.
+    uint64_t validity_bit_offset;
+    /// `Primitive`: the values. `Bool`: the bits. Null for `Binary`.
+    const uint8_t *values;
+    /// `Bool` only: where in `values` the first row's bit is.
+    uint64_t values_bit_offset;
+    /// `Binary` only: what all the column's values take together, which is the room
+    /// `vortex_ffi_chunk_copy_binary` has to be given.
+    uint64_t total_value_bytes;
 };
 
 /// Consumes `length` bytes of the file being written. Returns zero on success.
@@ -284,6 +334,33 @@ void vortex_ffi_scan_cancel(const FFI_VortexScan *scan);
 
 /// Frees the scan. The queues must no longer be driven: no task of it may still be running.
 void vortex_ffi_scan_free(FFI_VortexScan *scan);
+
+/// The number of rows in the chunk, which is the length of each of its columns.
+uint64_t vortex_ffi_chunk_row_count(const FFI_VortexChunk *chunk);
+
+/// Decodes the chunk and describes its columns into `out`, which has to have room for
+/// `num_columns` of them - the columns of the scan's schema, in that order. Returns zero on
+/// success, and the views stay valid until `on_chunk` returns.
+int32_t vortex_ffi_chunk_describe(FFI_VortexChunk *chunk, FFI_VortexColumnView *out, uint64_t num_columns, char **error);
+
+/// Writes the values of the `Binary` column `column` into the caller's own memory: the bytes of
+/// the values, end to end, into `chars`, and the offset each of them ends at into `offsets`. A
+/// null row contributes no bytes. `offsets` has to have room for the column's `length`, and
+/// `chars_capacity` is how many bytes may be written at `chars` - at least the column's
+/// `total_value_bytes`, and anything beyond that is scratch the decoder may use and the caller
+/// must not read. Returns zero on success.
+int32_t vortex_ffi_chunk_copy_binary(const FFI_VortexChunk *chunk,
+                                     uint64_t column,
+                                     uint8_t *chars,
+                                     uint64_t chars_capacity,
+                                     uint64_t *offsets,
+                                     char **error);
+
+/// Exports the chunk as one Arrow struct array into `out_array`, which the caller then owns and
+/// has to release. This is the way out for the types the caller has no direct conversion for; it
+/// lays every value out a second time, which is what `describe` exists to avoid. Returns zero on
+/// success.
+int32_t vortex_ffi_chunk_export_arrow(const FFI_VortexChunk *chunk, ArrowArray *out_array, char **error);
 
 /// Creates an expression referencing the top-level column `name`.
 FFI_VortexExpression *vortex_ffi_expr_column(const char *name);
